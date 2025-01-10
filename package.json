@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "dev": "NODE_OPTIONS='--loader ts-node/esm' ts-node src/index.ts",
     "lint": "eslint src/**/*.ts",
-    "test": "pnpm build && (pnpm start & sleep 2 && NODE_OPTIONS='--loader ts-node/esm' ts-node src/test-client.ts)"
+    "test": "pnpm build && (pnpm start & sleep 2 && NODE_OPTIONS='--loader ts-node/esm' node --experimental-specifier-resolution=node --loader ts-node/esm --no-warnings $(pwd)/src/test-client.ts)"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.1.0",
