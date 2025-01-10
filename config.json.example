@@ -1,0 +1,5 @@
+{
+  "clientId": "your-oauth2-client-id",
+  "clientSecret": "your-oauth2-client-secret",
+  "refreshToken": "your-refresh-token"
+}
