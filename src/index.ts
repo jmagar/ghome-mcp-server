@@ -1,67 +1,24 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { 
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  ErrorCode,
-  CallToolRequest
-} from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
 import { google } from "googleapis";
-const smartdevicemanagement = google.smartdevicemanagement('v1');
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createLogger, metrics, health } from "./logger.js";
+import { Config } from './types';
+import { tools, handlers } from './tools';
+import { SDMService } from './services/sdm';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-interface SmartPlugDevice {
-  id: string;
-  name: string;
-  type: string;
-  traits: {
-    [key: string]: any;
-  };
-  state: {
-    on: boolean;
-    online: boolean;
-  };
-}
-
-interface Config {
-  clientId: string;
-  clientSecret: string;
-  refreshToken?: string;
-}
-
-interface DeviceState {
-  id: string;
-  name?: {
-    name: string;
-  };
-  type: string;
-  states?: {
-    on?: boolean;
-    online?: boolean;
-  };
-}
-
-interface ControlPlugParams {
-  deviceId: string;
-  state: boolean;
-}
-
-interface GetPlugStateParams {
-  deviceId: string;
-}
-
 class GoogleHomeServer extends Server {
-  private sdm: ReturnType<typeof google.smartdevicemanagement> | null = null;
   private auth: OAuth2Client | null = null;
   private logger = createLogger('ghome-server');
   private config: Config;
+  private sdm: ReturnType<typeof google.smartdevicemanagement> | null = null;
 
   constructor() {
     super(
@@ -86,91 +43,102 @@ class GoogleHomeServer extends Server {
   }
 
   async initialize() {
-    return this.logger.measureOperation('server_initialize', async () => {
-      await this.setupAuth();
-      this.setupTools();
-      
-      // Register additional health checks
-      health.registerCheck('auth', async () => this.auth !== null);
-      health.registerCheck('sdm', async () => this.sdm !== null);
-    });
+    try {
+      return await this.logger.measureOperation('server_initialize', async () => {
+        await this.setupAuth();
+        this.setupTools();
+        
+        // Register additional health checks
+        health.registerCheck('auth', async () => this.auth !== null);
+        health.registerCheck('sdm', async () => this.sdm !== null);
+      });
+    } catch (error: any) {
+      this.logger.error("Failed to initialize server", {
+        error: error instanceof Error ? error.message : 
+              typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error)
+      });
+      throw error;
+    }
   }
 
   private async setupAuth() {
     return this.logger.measureOperation('setup_auth', async () => {
       try {
+        this.logger.debug('Starting auth setup', { 
+          hasRefreshToken: Boolean(this.config.refreshToken),
+          hasClientId: Boolean(this.config.clientId),
+          hasClientSecret: Boolean(this.config.clientSecret)
+        });
+
         if (!this.config.refreshToken) {
-          throw new Error('Refresh token not found in config.json. Please run get-refresh-token.ts first.');
+          const error = new Error('Refresh token not found in config.json. Please run get-refresh-token.ts first.');
+          this.logger.error(error.message);
+          metrics.increment('auth_setup_failures');
+          throw error;
         }
 
-        this.auth = new OAuth2Client({
-          clientId: this.config.clientId,
-          clientSecret: this.config.clientSecret,
-        });
+        if (!this.config.clientId || !this.config.clientSecret) {
+          const error = new Error('Missing clientId or clientSecret in config.json');
+          this.logger.error(error.message);
+          metrics.increment('auth_setup_failures');
+          throw error;
+        }
 
-        this.auth.setCredentials({
-          refresh_token: this.config.refreshToken
-        });
+        try {
+          this.logger.debug('Creating OAuth2Client...');
+          this.auth = new OAuth2Client({
+            clientId: this.config.clientId,
+            clientSecret: this.config.clientSecret
+          });
 
-        this.sdm = google.smartdevicemanagement({
-          version: 'v1',
-          auth: this.auth
-        });
+          this.logger.debug('Setting credentials...');
+          this.auth.setCredentials({
+            refresh_token: this.config.refreshToken
+          });
 
-        this.logger.info("Authentication setup completed successfully");
-      } catch (error) {
-        this.logger.error("Failed to setup authentication", { error: error instanceof Error ? error.message : String(error) });
+          this.logger.debug('Verifying access token...');
+          const token = await this.auth.getAccessToken();
+          this.logger.debug('Access token verified', { 
+            hasToken: Boolean(token),
+            tokenType: token?.token_type,
+            expiryDate: token?.expiry_date
+          });
+
+          this.logger.debug('Initializing SDM client...');
+          this.sdm = google.smartdevicemanagement({
+            version: 'v1',
+            auth: this.auth
+          });
+
+          this.logger.info("Authentication setup completed successfully", {
+            hasAuth: Boolean(this.auth),
+            hasSDM: Boolean(this.sdm)
+          });
+        } catch (authError: any) {
+          this.logger.error("OAuth2 setup failed", {
+            error: authError instanceof Error ? authError.message : 
+                  typeof authError === 'object' && authError !== null ? JSON.stringify(authError) : String(authError),
+            stack: authError instanceof Error ? authError.stack : undefined,
+            code: authError?.code,
+            response: authError?.response?.data
+          });
+          metrics.increment('oauth_setup_failures');
+          throw {
+            code: ErrorCode.InternalError,
+            message: "OAuth2 setup failed",
+            data: authError
+          };
+        }
+      } catch (error: any) {
+        this.logger.error("Failed to setup authentication", {
+          error: error instanceof Error ? error.message : 
+                typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+          code: error?.code,
+          response: error?.response?.data
+        });
         metrics.increment('auth_setup_failures');
-        throw {
-          code: ErrorCode.InternalError,
-          message: "Authentication setup failed",
-          data: error
-        };
-      }
-    });
-  }
-
-  private async getSmartPlugs(): Promise<SmartPlugDevice[]> {
-    return this.logger.measureOperation('get_smart_plugs', async () => {
-      if (!this.sdm) {
-        this.logger.error("Smart Device Management API not initialized");
-        metrics.increment('sdm_not_initialized_errors');
-        throw {
-          code: ErrorCode.InternalError,
-          message: "Smart Device Management API not initialized"
-        };
-      }
-
-      try {
-        const response = await this.sdm.enterprises.devices.list({
-          parent: 'enterprises/me'
-        });
-
-        const devices = response.data.devices || [];
-        const smartPlugs = devices
-          .filter(device => device.type === 'sdm.devices.types.OUTLET' && device.name)
-          .map(device => ({
-            id: device.name!,
-            name: device.traits?.['sdm.devices.traits.Info']?.customName || device.name!,
-            type: device.type || 'sdm.devices.types.OUTLET',
-            traits: device.traits || {},
-            state: {
-              on: Boolean(device.traits?.['sdm.devices.traits.OnOff']?.on),
-              online: device.traits?.['sdm.devices.traits.Connectivity']?.status === 'ONLINE'
-            }
-          }));
-
-        metrics.gauge('smart_plugs_count', smartPlugs.length);
-        this.logger.info(`Found ${smartPlugs.length} smart plugs`);
-        return smartPlugs;
-      } catch (error) {
-        this.logger.error("Failed to get devices", { error: error instanceof Error ? error.message : String(error) });
-        metrics.increment('get_devices_errors');
-        throw {
-          code: ErrorCode.InternalError,
-          message: "Failed to get devices",
-          data: error
-        };
+        throw error;
       }
     });
   }
@@ -180,52 +148,7 @@ class GoogleHomeServer extends Server {
     this.setRequestHandler(ListToolsRequestSchema, async () => {
       this.logger.debug("Handling list_tools request");
       metrics.increment('list_tools_requests');
-      
-      return {
-        tools: [
-          {
-            name: "list_smart_plugs",
-            description: "List all available smart plugs and their current states",
-            inputSchema: {
-              type: "object",
-              properties: {},
-              required: []
-            }
-          },
-          {
-            name: "control_smart_plug",
-            description: "Turn a smart plug on or off",
-            inputSchema: {
-              type: "object",
-              properties: {
-                deviceId: {
-                  type: "string",
-                  description: "The ID of the smart plug to control"
-                },
-                state: {
-                  type: "boolean",
-                  description: "True to turn on, false to turn off"
-                }
-              },
-              required: ["deviceId", "state"]
-            }
-          },
-          {
-            name: "get_smart_plug_state",
-            description: "Get the current state of a specific smart plug",
-            inputSchema: {
-              type: "object",
-              properties: {
-                deviceId: {
-                  type: "string",
-                  description: "The ID of the smart plug to query"
-                }
-              },
-              required: ["deviceId"]
-            }
-          }
-        ]
-      };
+      return { tools };
     });
 
     // Handle tool execution
@@ -235,149 +158,17 @@ class GoogleHomeServer extends Server {
         this.logger.info(`Executing tool: ${name}`, { args: args || {} });
         metrics.increment(`tool_execution_${name}`);
 
-        switch (name) {
-          case "list_smart_plugs":
-            return {
-              content: await this.getSmartPlugs()
-            };
-
-          case "control_smart_plug": {
-            if (!args || typeof args !== 'object' || !('deviceId' in args) || !('state' in args)) {
-              this.logger.warn("Invalid parameters for control_smart_plug", { args: args || {} });
-              metrics.increment('invalid_control_params_errors');
-              throw {
-                code: ErrorCode.InvalidParams,
-                message: "Missing required parameters: deviceId and state"
-              };
-            }
-            
-            const params: ControlPlugParams = {
-              deviceId: String(args.deviceId),
-              state: Boolean(args.state)
-            };
-
-            if (!this.sdm) {
-              this.logger.error("Smart Device Management API not initialized");
-              metrics.increment('sdm_not_initialized_errors');
-              throw {
-                code: ErrorCode.InternalError,
-                message: "Smart Device Management API not initialized"
-              };
-            }
-
-            try {
-              await this.sdm.enterprises.devices.executeCommand({
-                name: params.deviceId,
-                requestBody: {
-                  command: 'sdm.devices.commands.OnOff.Set',
-                  params: {
-                    on: params.state
-                  }
-                }
-              });
-
-              this.logger.info(`Successfully controlled device ${params.deviceId}`, { state: params.state });
-              metrics.increment(`device_control_success`);
-
-              return {
-                content: {
-                  success: true,
-                  device: {
-                    id: params.deviceId,
-                    state: {
-                      on: params.state,
-                      online: true
-                    }
-                  }
-                }
-              };
-            } catch (error) {
-              this.logger.error(`Failed to control device ${params.deviceId}`, { 
-                error: error instanceof Error ? error.message : String(error),
-                state: params.state 
-              });
-              metrics.increment('device_control_errors');
-              throw {
-                code: ErrorCode.InternalError,
-                message: `Failed to control device ${params.deviceId}`,
-                data: error
-              };
-            }
-          }
-
-          case "get_smart_plug_state": {
-            if (!args || typeof args !== 'object' || !('deviceId' in args)) {
-              this.logger.warn("Invalid parameters for get_smart_plug_state", { args: args || {} });
-              metrics.increment('invalid_get_state_params_errors');
-              throw {
-                code: ErrorCode.InvalidParams,
-                message: "Missing required parameter: deviceId"
-              };
-            }
-
-            const params: GetPlugStateParams = {
-              deviceId: String(args.deviceId)
-            };
-
-            if (!this.sdm) {
-              this.logger.error("Smart Device Management API not initialized");
-              metrics.increment('sdm_not_initialized_errors');
-              throw {
-                code: ErrorCode.InternalError,
-                message: "Smart Device Management API not initialized"
-              };
-            }
-
-            try {
-              const response = await this.sdm.enterprises.devices.get({
-                name: params.deviceId
-              });
-
-              const device = response.data;
-              if (!device) {
-                this.logger.warn(`Device not found: ${params.deviceId}`);
-                metrics.increment('device_not_found_errors');
-                throw {
-                  code: ErrorCode.InvalidParams,
-                  message: `Device not found: ${params.deviceId}`
-                };
-              }
-
-              this.logger.info(`Successfully retrieved state for device ${params.deviceId}`);
-              metrics.increment('get_device_state_success');
-
-              return {
-                content: {
-                  id: device.name,
-                  name: device.traits?.['sdm.devices.traits.Info']?.customName || device.name,
-                  type: device.type,
-                  state: {
-                    on: device.traits?.['sdm.devices.traits.OnOff']?.on || false,
-                    online: device.traits?.['sdm.devices.traits.Connectivity']?.status === 'ONLINE'
-                  }
-                }
-              };
-            } catch (error) {
-              this.logger.error(`Failed to get device state: ${params.deviceId}`, { 
-                error: error instanceof Error ? error.message : String(error) 
-              });
-              metrics.increment('get_device_state_errors');
-              throw {
-                code: ErrorCode.InternalError,
-                message: `Failed to get device state: ${params.deviceId}`,
-                data: error
-              };
-            }
-          }
-
-          default:
-            this.logger.warn(`Unknown tool: ${name}`);
-            metrics.increment('unknown_tool_errors');
-            throw {
-              code: ErrorCode.MethodNotFound,
-              message: `Unknown tool: ${name}`
-            };
+        const handler = handlers[name as keyof typeof handlers];
+        if (!handler) {
+          this.logger.warn(`Unknown tool: ${name}`);
+          metrics.increment('unknown_tool_errors');
+          throw {
+            code: ErrorCode.MethodNotFound,
+            message: `Unknown tool: ${name}`
+          };
         }
+
+        return handler(this.sdm, args);
       });
     });
   }
@@ -397,16 +188,26 @@ async function main() {
   let server: GoogleHomeServer | null = null;
 
   try {
-    // Set up global unhandled rejection handler
-    process.on('unhandledRejection', (error) => {
+    logger.debug('Starting main function...');
+
+    // Set up global unhandled rejection handler first
+    logger.debug('Setting up unhandled rejection handler...');
+    process.on('unhandledRejection', (error: any) => {
       logger.error('Unhandled promise rejection', { 
-        error: error instanceof Error ? error.message : String(error) 
+        error: error instanceof Error ? error.message : 
+              typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        code: error?.code,
+        response: error?.response?.data,
+        type: typeof error,
+        fullError: JSON.stringify(error, null, 2)
       });
       metrics.increment('unhandled_rejections');
       process.exit(1);
     });
 
     // Set up SIGINT handler
+    logger.debug('Setting up SIGINT handler...');
     process.on('SIGINT', async () => {
       logger.info('Received SIGINT signal');
       metrics.increment('sigint_received');
@@ -415,9 +216,11 @@ async function main() {
         try {
           await server.cleanup();
           logger.info('Server cleanup completed');
-        } catch (error) {
+        } catch (cleanupError: any) {
           logger.error('Error during server cleanup', { 
-            error: error instanceof Error ? error.message : String(error) 
+            error: cleanupError instanceof Error ? cleanupError.message : 
+                  typeof cleanupError === 'object' && cleanupError !== null ? JSON.stringify(cleanupError) : String(cleanupError),
+            stack: cleanupError instanceof Error ? cleanupError.stack : undefined
           });
           metrics.increment('cleanup_errors');
         }
@@ -426,37 +229,59 @@ async function main() {
     });
 
     // Initialize and start server
+    logger.debug('Creating server instance...');
     server = new GoogleHomeServer();
+
+    logger.debug('Initializing server...');
     await server.initialize();
     
+    logger.debug('Creating transport...');
     const transport = new StdioServerTransport();
+    
+    logger.debug('Connecting transport...');
     await server.connect(transport);
     
     logger.info("Google Home MCP server started successfully");
     metrics.increment('server_starts');
 
     // Start periodic health checks
+    logger.debug('Starting health check interval...');
     setInterval(async () => {
-      const healthStatus = await health.performChecks();
-      logger.debug('Health check results', { health: healthStatus });
-      
-      Object.entries(healthStatus).forEach(([check, status]) => {
-        metrics.gauge(`health_${check}`, status ? 1 : 0);
-      });
-    }, 60000); // Every minute
+      try {
+        const healthStatus = await health.performChecks();
+        logger.debug('Health check results', { health: healthStatus });
+        
+        Object.entries(healthStatus).forEach(([check, status]) => {
+          metrics.gauge(`health_${check}`, status ? 1 : 0);
+        });
+      } catch (error: any) {
+        logger.error('Health check failed', {
+          error: error instanceof Error ? error.message : 
+                typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error),
+          stack: error instanceof Error ? error.stack : undefined
+        });
+      }
+    }, 60000);
 
-  } catch (error) {
+  } catch (error: any) {
     logger.error("Failed to start server", { 
-      error: error instanceof Error ? error.message : String(error) 
+      error: error instanceof Error ? error.message : 
+            typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      code: error?.code,
+      response: error?.response?.data,
+      fullError: JSON.stringify(error, null, 2)
     });
     metrics.increment('server_start_failures');
     
     if (server) {
       try {
         await server.cleanup();
-      } catch (cleanupError) {
+      } catch (cleanupError: any) {
         logger.error("Error during cleanup", { 
-          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError) 
+          error: cleanupError instanceof Error ? cleanupError.message : 
+                typeof cleanupError === 'object' && cleanupError !== null ? JSON.stringify(cleanupError) : String(cleanupError),
+          stack: cleanupError instanceof Error ? cleanupError.stack : undefined
         });
         metrics.increment('cleanup_errors');
       }
@@ -465,12 +290,14 @@ async function main() {
   }
 }
 
-// Handle any errors that occur during main execution
-main().catch((error) => {
-  const logger = createLogger('main');
-  logger.error("Fatal error during server execution", { 
-    error: error instanceof Error ? error.message : String(error) 
+// Start the server
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    const logger = createLogger('main');
+    logger.error("Fatal error during server execution", { 
+      error: error instanceof Error ? error.message : String(error) 
+    });
+    metrics.increment('fatal_errors');
+    process.exit(1);
   });
-  metrics.increment('fatal_errors');
-  process.exit(1);
-});
+}

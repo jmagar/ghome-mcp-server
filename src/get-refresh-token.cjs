@@ -4,7 +4,6 @@ const { join } = require('path');
 const express = require('express');
 
 const SCOPES = [
-  'https://www.googleapis.com/auth/sdm.service',
   'https://www.googleapis.com/auth/homegraph'
 ];
 

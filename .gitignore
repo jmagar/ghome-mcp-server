@@ -47,6 +47,3 @@ temp/
 
 # Local development files
 *.local
-
-# Project specific
-context/ 
