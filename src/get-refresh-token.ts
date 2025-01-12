@@ -7,7 +7,7 @@ import open from 'open';
 import * as path from 'path';
 
 const SCOPES = [
-  'https://www.googleapis.com/auth/sdm.service'
+  'https://www.googleapis.com/auth/homegraph'
 ];
 
 async function getRefreshToken() {

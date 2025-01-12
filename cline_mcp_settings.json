@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ghome-mcp-server": {
+      "command": "node",
+      "args": ["/home/jmagar/code/ghome-mcp-server/dist/index.js"],
+      "transport": "stdio"
+    }
+  }
+} 

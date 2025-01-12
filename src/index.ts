@@ -1,15 +1,15 @@
+#!/usr/bin/env node
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, CallToolRequest } from "@modelcontextprotocol/sdk/types.js";
-import { google } from "googleapis";
+import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { OAuth2Client } from "google-auth-library";
 import { readFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { createLogger, metrics, health } from "./logger.js";
-import { Config } from './types';
-import { tools, handlers } from './tools';
-import { SDMService } from './services/sdm';
+import { Config } from './types/index.js';
+import { tools, handlers } from './tools/index.js';
+import { HomeGraphService } from './services/homegraph.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -18,7 +18,7 @@ class GoogleHomeServer extends Server {
   private auth: OAuth2Client | null = null;
   private logger = createLogger('ghome-server');
   private config: Config;
-  private sdm: ReturnType<typeof google.smartdevicemanagement> | null = null;
+  private homegraph: HomeGraphService | null = null;
 
   constructor() {
     super(
@@ -28,37 +28,115 @@ class GoogleHomeServer extends Server {
       },
       {
         capabilities: {
-          tools: {}
+          tools: {
+            execution: true
+          }
         }
       }
     );
 
+    this.logger.info("Server instance created");
+
     try {
       const configPath = join(__dirname, "../config.json");
       this.config = JSON.parse(readFileSync(configPath, "utf-8"));
+      this.logger.debug("Config loaded successfully", { 
+        hasClientId: Boolean(this.config.clientId),
+        hasClientSecret: Boolean(this.config.clientSecret),
+        hasRefreshToken: Boolean(this.config.refreshToken)
+      });
     } catch (error) {
-      this.logger.error("Failed to load config.json", { error: error instanceof Error ? error.message : String(error) });
+      this.logger.error("Failed to load config.json", { error });
       throw new Error("Failed to load config.json");
     }
+  }
+
+  async connect(transport: StdioServerTransport): Promise<void> {
+    this.logger.info("Connecting to transport...");
+    transport.onmessage = (message) => {
+      this.logger.debug("Received message", { 
+        type: 'method' in message ? 'request/notification' : 'response',
+        hasId: 'id' in message,
+        hasParams: 'params' in message
+      });
+    };
+    transport.onerror = (error) => {
+      this.logger.error("Transport error", { error });
+    };
+    transport.onclose = () => {
+      this.logger.info("Transport connection closed");
+    };
+    await super.connect(transport);
+    this.logger.info("Connected to transport successfully");
   }
 
   async initialize() {
     try {
       return await this.logger.measureOperation('server_initialize', async () => {
+        this.logger.info("Starting server initialization...");
         await this.setupAuth();
+        this.homegraph = new HomeGraphService(this.auth!);
         this.setupTools();
         
-        // Register additional health checks
         health.registerCheck('auth', async () => this.auth !== null);
-        health.registerCheck('sdm', async () => this.sdm !== null);
+        health.registerCheck('homegraph', async () => this.homegraph !== null);
+        this.logger.info("Server initialization completed");
       });
-    } catch (error: any) {
-      this.logger.error("Failed to initialize server", {
-        error: error instanceof Error ? error.message : 
-              typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error)
-      });
+    } catch (error) {
+      this.logger.error("Failed to initialize server", { error });
       throw error;
     }
+  }
+
+  protected setupTools() {
+    this.logger.info("Setting up tools...");
+    this.setRequestHandler(ListToolsRequestSchema, async () => {
+      this.logger.debug("Handling list_tools request");
+      metrics.increment('list_tools_requests');
+      const response = { tools };
+      this.logger.debug("Returning tools list", { toolCount: tools.length });
+      return response;
+    });
+
+    this.setRequestHandler(CallToolRequestSchema, async (request) => {
+      return this.logger.measureOperation(`execute_tool_${request.params.name}`, async () => {
+        const { name, arguments: toolArgs } = request.params;
+        this.logger.info(`Executing tool: ${name}`, { 
+          args: toolArgs,
+          hasArgs: Boolean(toolArgs)
+        });
+        metrics.increment(`tool_execution_${name}`);
+
+        const handler = handlers[name as keyof typeof handlers];
+        if (!handler) {
+          this.logger.warn(`Unknown tool: ${name}`);
+          metrics.increment('unknown_tool_errors');
+          throw {
+            code: ErrorCode.MethodNotFound,
+            message: `Unknown tool: ${name}`
+          };
+        }
+
+        this.logger.debug(`Starting execution of ${name}`);
+        const response = await handler(this.homegraph!, toolArgs || {});
+        this.logger.debug(`Completed execution of ${name}`, {
+          contentLength: response.content.length
+        });
+        return {
+          content: response.content
+        };
+      });
+    });
+    this.logger.info("Tools setup completed");
+  }
+
+  async cleanup(): Promise<void> {
+    return this.logger.measureOperation('server_cleanup', async () => {
+      this.logger.info('Cleaning up server...');
+      this.homegraph = null;
+      this.auth = null;
+      this.logger.info('Server cleanup completed');
+    });
   }
 
   private async setupAuth() {
@@ -98,30 +176,18 @@ class GoogleHomeServer extends Server {
 
           this.logger.debug('Verifying access token...');
           const token = await this.auth.getAccessToken();
+          const credentials = this.auth.credentials;
           this.logger.debug('Access token verified', { 
             hasToken: Boolean(token),
-            tokenType: token?.token_type,
-            expiryDate: token?.expiry_date
-          });
-
-          this.logger.debug('Initializing SDM client...');
-          this.sdm = google.smartdevicemanagement({
-            version: 'v1',
-            auth: this.auth
+            tokenType: credentials.token_type,
+            expiryDate: credentials.expiry_date
           });
 
           this.logger.info("Authentication setup completed successfully", {
-            hasAuth: Boolean(this.auth),
-            hasSDM: Boolean(this.sdm)
+            hasAuth: Boolean(this.auth)
           });
-        } catch (authError: any) {
-          this.logger.error("OAuth2 setup failed", {
-            error: authError instanceof Error ? authError.message : 
-                  typeof authError === 'object' && authError !== null ? JSON.stringify(authError) : String(authError),
-            stack: authError instanceof Error ? authError.stack : undefined,
-            code: authError?.code,
-            response: authError?.response?.data
-          });
+        } catch (authError) {
+          this.logger.error("OAuth2 setup failed", { error: authError });
           metrics.increment('oauth_setup_failures');
           throw {
             code: ErrorCode.InternalError,
@@ -129,56 +195,11 @@ class GoogleHomeServer extends Server {
             data: authError
           };
         }
-      } catch (error: any) {
-        this.logger.error("Failed to setup authentication", {
-          error: error instanceof Error ? error.message : 
-                typeof error === 'object' && error !== null ? JSON.stringify(error) : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-          code: error?.code,
-          response: error?.response?.data
-        });
+      } catch (error) {
+        this.logger.error("Failed to setup authentication", { error });
         metrics.increment('auth_setup_failures');
         throw error;
       }
-    });
-  }
-
-  protected setupTools() {
-    // List available tools
-    this.setRequestHandler(ListToolsRequestSchema, async () => {
-      this.logger.debug("Handling list_tools request");
-      metrics.increment('list_tools_requests');
-      return { tools };
-    });
-
-    // Handle tool execution
-    this.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest) => {
-      return this.logger.measureOperation(`execute_tool_${request.params.name}`, async () => {
-        const { name, arguments: args } = request.params;
-        this.logger.info(`Executing tool: ${name}`, { args: args || {} });
-        metrics.increment(`tool_execution_${name}`);
-
-        const handler = handlers[name as keyof typeof handlers];
-        if (!handler) {
-          this.logger.warn(`Unknown tool: ${name}`);
-          metrics.increment('unknown_tool_errors');
-          throw {
-            code: ErrorCode.MethodNotFound,
-            message: `Unknown tool: ${name}`
-          };
-        }
-
-        return handler(this.sdm, args);
-      });
-    });
-  }
-
-  async cleanup(): Promise<void> {
-    return this.logger.measureOperation('server_cleanup', async () => {
-      this.logger.info('Cleaning up server...');
-      this.sdm = null;
-      this.auth = null;
-      this.logger.info('Server cleanup completed');
     });
   }
 }
